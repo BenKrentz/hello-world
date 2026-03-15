@@ -9,11 +9,11 @@ import android.media.Image
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.util.Range
 import android.util.Size
 import android.view.Surface
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.suspendCancellableCoroutine
-import java.nio.ShortBuffer
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -29,8 +29,28 @@ class RawCameraManager(private val context: Context) {
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var imageReader: ImageReader? = null
+    private var previewImageReader: ImageReader? = null
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
+
+    /**
+     * Exposure settings for manual capture control.
+     */
+    data class ExposureSettings(
+        val iso: Int = 100,
+        val exposureTimeNs: Long = 33_333_333L, // 1/30s
+        val autoExposure: Boolean = false
+    )
+
+    /**
+     * Information about a camera's capabilities.
+     */
+    data class CameraInfo(
+        val id: String,
+        val isoRange: Range<Int>,
+        val exposureRange: Range<Long>,
+        val rawSizes: Array<Size>
+    )
 
     data class RawFrame(
         val width: Int,
@@ -56,6 +76,21 @@ class RawCameraManager(private val context: Context) {
             if (supportsRaw) return id
         }
         return null
+    }
+
+    /** Get detailed info about a RAW-capable camera. */
+    fun getCameraInfo(cameraId: String): CameraInfo {
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val chars = manager.getCameraCharacteristics(cameraId)
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
+
+        val isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            ?: Range(100, 800)
+        val exposureRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            ?: Range(1_000_000L, 1_000_000_000L)
+        val rawSizes = map.getOutputSizes(ImageFormat.RAW_SENSOR) ?: emptyArray()
+
+        return CameraInfo(cameraId, isoRange, exposureRange, rawSizes)
     }
 
     /** Get available RAW output sizes for the given camera. */
@@ -115,10 +150,63 @@ class RawCameraManager(private val context: Context) {
     }
 
     /**
+     * Start a preview capture session that delivers low-res YUV frames for the
+     * live viewfinder. The callback receives each preview frame as a simple
+     * intensity line profile (averaged rows) for real-time spectral strip display.
+     */
+    suspend fun startPreview(
+        cameraId: String,
+        previewSurface: Surface,
+        exposure: ExposureSettings = ExposureSettings()
+    ): Unit = suspendCancellableCoroutine { cont ->
+        val camera = cameraDevice
+            ?: throw IllegalStateException("Camera not opened")
+
+        val surfaces = listOf(previewSurface)
+
+        camera.createCaptureSession(
+            surfaces,
+            object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    captureSession = session
+
+                    val request = camera.createCaptureRequest(
+                        CameraDevice.TEMPLATE_PREVIEW
+                    ).apply {
+                        addTarget(previewSurface)
+                        if (!exposure.autoExposure) {
+                            set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_OFF)
+                            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                            set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
+                            set(CaptureRequest.SENSOR_SENSITIVITY, exposure.iso)
+                            set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposure.exposureTimeNs)
+                        }
+                    }.build()
+
+                    session.setRepeatingRequest(request, null, backgroundHandler)
+                    if (cont.isActive) cont.resume(Unit)
+                }
+
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    if (cont.isActive) {
+                        cont.resumeWithException(
+                            RuntimeException("Preview session configuration failed")
+                        )
+                    }
+                }
+            },
+            backgroundHandler
+        )
+    }
+
+    /**
      * Capture a single RAW frame. Returns the raw 16-bit Bayer data along
      * with metadata needed for spectral processing.
      */
-    suspend fun captureRawFrame(cameraId: String): RawFrame = suspendCancellableCoroutine { cont ->
+    suspend fun captureRawFrame(
+        cameraId: String,
+        exposure: ExposureSettings = ExposureSettings()
+    ): RawFrame = suspendCancellableCoroutine { cont ->
         val camera = cameraDevice
             ?: throw IllegalStateException("Camera not opened")
 
@@ -157,13 +245,19 @@ class RawCameraManager(private val context: Context) {
                         CameraDevice.TEMPLATE_STILL_CAPTURE
                     ).apply {
                         addTarget(imageReader!!.surface)
-                        // Use manual mode for consistent, repeatable captures
-                        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_OFF)
-                        set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                        set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
-                        // Sensible defaults — user can adjust via UI
-                        set(CaptureRequest.SENSOR_SENSITIVITY, 100)        // ISO 100
-                        set(CaptureRequest.SENSOR_EXPOSURE_TIME, 33_333_333L) // 1/30s
+                        if (exposure.autoExposure) {
+                            set(CaptureRequest.CONTROL_AE_MODE,
+                                CaptureRequest.CONTROL_AE_MODE_ON)
+                        } else {
+                            set(CaptureRequest.CONTROL_MODE,
+                                CaptureRequest.CONTROL_MODE_OFF)
+                            set(CaptureRequest.CONTROL_AE_MODE,
+                                CaptureRequest.CONTROL_AE_MODE_OFF)
+                            set(CaptureRequest.CONTROL_AWB_MODE,
+                                CaptureRequest.CONTROL_AWB_MODE_OFF)
+                            set(CaptureRequest.SENSOR_SENSITIVITY, exposure.iso)
+                            set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposure.exposureTimeNs)
+                        }
                     }.build()
 
                     session.capture(request, null, backgroundHandler)
@@ -200,7 +294,19 @@ class RawCameraManager(private val context: Context) {
         val blackLevelPattern = characteristics.get(
             CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN
         )
-        val blackLevel = IntArray(4) { blackLevelPattern?.getOffsetForIndex(0, it) ?: 0 }
+        // BlackLevelPattern stores 4 values in a 2x2 pattern (row, col):
+        // (0,0) (0,1)
+        // (1,0) (1,1)
+        val blackLevel = if (blackLevelPattern != null) {
+            intArrayOf(
+                blackLevelPattern.getOffsetForIndex(0, 0),
+                blackLevelPattern.getOffsetForIndex(0, 1),
+                blackLevelPattern.getOffsetForIndex(1, 0),
+                blackLevelPattern.getOffsetForIndex(1, 1)
+            )
+        } else {
+            intArrayOf(0, 0, 0, 0)
+        }
 
         val whiteLevel = characteristics.get(
             CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL
@@ -218,8 +324,13 @@ class RawCameraManager(private val context: Context) {
 
     fun release() {
         captureSession?.close()
+        captureSession = null
         cameraDevice?.close()
+        cameraDevice = null
         imageReader?.close()
+        imageReader = null
+        previewImageReader?.close()
+        previewImageReader = null
         stopBackgroundThread()
     }
 }
